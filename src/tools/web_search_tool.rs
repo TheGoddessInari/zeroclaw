@@ -59,35 +59,39 @@ impl WebSearchTool {
         // Extract snippets: <a class="result__snippet">...</a>
         let snippet_regex = Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#)?;
 
-        let link_matches: Vec<_> = link_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
-
-        let snippet_matches: Vec<_> = snippet_regex
-            .captures_iter(html)
-            .take(self.max_results + 2)
-            .collect();
+        let link_matches: Vec<_> = link_regex.captures_iter(html).collect();
 
         if link_matches.is_empty() {
             return Ok(format!("No results found for: {}", query));
         }
 
         let mut lines = vec![format!("Search results for: {} (via DuckDuckGo)", query)];
-
         let count = link_matches.len().min(self.max_results);
 
         for i in 0..count {
-            let caps = &link_matches[i];
-            let url_str = decode_ddg_redirect_url(&caps[1]);
-            let title = strip_tags(&caps[2]);
+            let link_cap = &link_matches[i];
+            let link_match = link_cap.get(0).unwrap();
+            let link_end = link_match.end();
+
+            // Determine the end of the search range for the snippet
+            // If there is a next link, stop before it. Otherwise, search until the end of the HTML.
+            let next_start = if i + 1 < link_matches.len() {
+                link_matches[i + 1].get(0).unwrap().start()
+            } else {
+                html.len()
+            };
+
+            let snippet_search_area = &html[link_end..next_start];
+
+            let url_str = decode_ddg_redirect_url(&link_cap[1]);
+            let title = strip_tags(&link_cap[2]);
 
             lines.push(format!("{}. {}", i + 1, title.trim()));
             lines.push(format!("   {}", url_str.trim()));
 
-            // Add snippet if available
-            if i < snippet_matches.len() {
-                let snippet = strip_tags(&snippet_matches[i][1]);
+            // Find snippet in the specific area between this link and the next
+            if let Some(snippet_cap) = snippet_regex.captures(snippet_search_area) {
+                let snippet = strip_tags(&snippet_cap[1]);
                 let snippet = snippet.trim();
                 if !snippet.is_empty() {
                     lines.push(format!("   {}", snippet));
@@ -327,5 +331,57 @@ mod tests {
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));
+    }
+
+    #[test]
+    fn test_parse_duckduckgo_results_misalignment() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let html = r#"
+            <div class="result">
+                <a class="result__a" href="https://example.com/1">Result 1</a>
+                <!-- No snippet here -->
+            </div>
+            <div class="result">
+                <a class="result__a" href="https://example.com/2">Result 2</a>
+                <a class="result__snippet">Snippet 2</a>
+            </div>
+        "#;
+        let result = tool.parse_duckduckgo_results(html, "test").unwrap();
+
+        // With the bug, Result 1 gets Snippet 2.
+        // Result:
+        // 1. Result 1
+        //    https://example.com/1
+        //    Snippet 2
+        // 2. Result 2
+        //    https://example.com/2
+
+        // We want to assert that Result 1 does NOT have Snippet 2.
+        // And Result 2 DOES have Snippet 2.
+
+        let lines: Vec<&str> = result.lines().collect();
+        let mut result1_lines = Vec::new();
+        let mut result2_lines = Vec::new();
+        let mut current_result = 0;
+
+        for line in lines {
+            if line.starts_with("1. ") {
+                current_result = 1;
+            } else if line.starts_with("2. ") {
+                current_result = 2;
+            }
+
+            if current_result == 1 {
+                result1_lines.push(line);
+            } else if current_result == 2 {
+                result2_lines.push(line);
+            }
+        }
+
+        let res1_str = result1_lines.join("\n");
+        let res2_str = result2_lines.join("\n");
+
+        assert!(!res1_str.contains("Snippet 2"), "Result 1 should not have Snippet 2, but got:\n{}", res1_str);
+        assert!(res2_str.contains("Snippet 2"), "Result 2 should have Snippet 2, but got:\n{}", res2_str);
     }
 }

@@ -294,7 +294,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search the web for information. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics."
+        "Search the web for information. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics. For specifically finding recent news articles, headlines, and dates, set 'search_type' to 'news'."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -544,5 +544,28 @@ mod tests {
         let json = json!({ "results": [] });
         let result = tool.parse_duckduckgo_news_results(&json, "test").unwrap();
         assert!(result.contains("No news results found"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_duckduckgo_news_integration() {
+        // This test makes real network requests to DuckDuckGo.
+        // Run with `cargo test --lib tools::web_search_tool::tests::test_live_duckduckgo_news_integration -- --ignored`
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+
+        let args = json!({
+            "query": "technology",
+            "search_type": "news"
+        });
+
+        let result = tool.execute(args).await.expect("Execution failed");
+
+        println!("Live News Result:\n{}", result.output);
+        assert!(result.success);
+        assert!(result.output.contains("News results for: technology"));
+        // Live results should have content, but we can't guarantee specific headlines.
+        // We can check for structural markers.
+        assert!(result.output.contains("1."));
+        assert!(result.output.contains("Source:"));
     }
 }

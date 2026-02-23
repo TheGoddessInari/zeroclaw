@@ -166,6 +166,108 @@ impl WebSearchTool {
 
         Ok(lines.join("\n"))
     }
+
+    async fn search_duckduckgo_news(&self, query: &str) -> anyhow::Result<String> {
+        let vqd = self.fetch_vqd(query).await?;
+        let encoded_query = urlencoding::encode(query);
+        let url = format!(
+            "https://duckduckgo.com/news.js?l=wt-wt&o=json&q={}&vqd={}&p=-1&s=0",
+            encoded_query, vqd
+        );
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()?;
+
+        let response = client
+            .get(&url)
+            .header("Referer", "https://duckduckgo.com/")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("DuckDuckGo news search failed with status: {}", response.status());
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        self.parse_duckduckgo_news_results(&json, query)
+    }
+
+    fn parse_duckduckgo_news_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Invalid DuckDuckGo news response"))?;
+
+        if results.is_empty() {
+            return Ok(format!("No news results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("News results for: {} (via DuckDuckGo)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let excerpt = result
+                .get("excerpt")
+                .and_then(|e| e.as_str())
+                .map(strip_tags)
+                .unwrap_or_default();
+            let source = result
+                .get("source")
+                .and_then(|s| s.as_str())
+                .unwrap_or("Unknown Source");
+            let relative_time = result
+                .get("relative_time")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   Source: {} ({})", source, relative_time));
+            lines.push(format!("   {}", url));
+            if !excerpt.is_empty() {
+                lines.push(format!("   {}", excerpt));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    async fn fetch_vqd(&self, query: &str) -> anyhow::Result<String> {
+        let encoded_query = urlencoding::encode(query);
+        let url = format!("https://duckduckgo.com/?q={}", encoded_query);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()?;
+
+        let response = client
+            .get(&url)
+            .header("Referer", "https://duckduckgo.com/")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to fetch VQD token: {}", response.status());
+        }
+
+        let text = response.text().await?;
+        let re = Regex::new(r#"vqd=['"]([a-zA-Z0-9-]+)['"]"#)?;
+
+        re.captures(&text)
+            .and_then(|caps| caps.get(1))
+            .map(|m| m.as_str().to_string())
+            .ok_or_else(|| anyhow::anyhow!("No vqd found in DDG search page"))
+    }
 }
 
 fn decode_ddg_redirect_url(raw_url: &str) -> String {
@@ -202,6 +304,12 @@ impl Tool for WebSearchTool {
                 "query": {
                     "type": "string",
                     "description": "The search query. Be specific for better results."
+                },
+                "search_type": {
+                    "type": "string",
+                    "enum": ["text", "news"],
+                    "description": "The type of search to perform. Defaults to 'text'. Use 'news' for finding current news articles.",
+                    "default": "text"
                 }
             },
             "required": ["query"]
@@ -214,15 +322,26 @@ impl Tool for WebSearchTool {
             .and_then(|q| q.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: query"))?;
 
+        let search_type = args
+            .get("search_type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("text");
+
         if query.trim().is_empty() {
             anyhow::bail!("Search query cannot be empty");
         }
 
-        tracing::info!("Searching web for: {}", query);
+        tracing::info!("Searching web ({}) for: {}", search_type, query);
 
         let result = match self.provider.as_str() {
-            "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
-            "brave" => self.search_brave(query).await?,
+            "duckduckgo" | "ddg" => {
+                if search_type.eq_ignore_ascii_case("news") {
+                    self.search_duckduckgo_news(query).await?
+                } else {
+                    self.search_duckduckgo(query).await?
+                }
+            }
+            "brave" => self.search_brave(query).await?, // Brave implementation doesn't support news mode yet
             _ => anyhow::bail!(
                 "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
                 self.provider
@@ -259,6 +378,7 @@ mod tests {
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["query"].is_object());
+        assert!(schema["properties"]["search_type"].is_object());
     }
 
     #[test]
@@ -383,5 +503,46 @@ mod tests {
 
         assert!(!res1_str.contains("Snippet 2"), "Result 1 should not have Snippet 2, but got:\n{}", res1_str);
         assert!(res2_str.contains("Snippet 2"), "Result 2 should have Snippet 2, but got:\n{}", res2_str);
+    }
+
+    #[test]
+    fn test_parse_duckduckgo_news_results_success() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let json = json!({
+            "results": [
+                {
+                    "title": "News Title 1",
+                    "url": "https://news.com/1",
+                    "excerpt": "This is a news excerpt.",
+                    "source": "News Source",
+                    "relative_time": "1 hour ago",
+                    "date": 1234567890
+                },
+                {
+                    "title": "News Title 2",
+                    "url": "https://news.com/2",
+                    "source": "Another Source",
+                    "relative_time": "2 hours ago"
+                    // missing excerpt
+                }
+            ]
+        });
+
+        let result = tool.parse_duckduckgo_news_results(&json, "test").unwrap();
+        assert!(result.contains("News results for: test"));
+        assert!(result.contains("News Title 1"));
+        assert!(result.contains("This is a news excerpt"));
+        assert!(result.contains("News Source"));
+        assert!(result.contains("1 hour ago"));
+        assert!(result.contains("News Title 2"));
+        assert!(result.contains("Another Source"));
+    }
+
+    #[test]
+    fn test_parse_duckduckgo_news_results_empty() {
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let json = json!({ "results": [] });
+        let result = tool.parse_duckduckgo_news_results(&json, "test").unwrap();
+        assert!(result.contains("No news results found"));
     }
 }
